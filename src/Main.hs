@@ -6,6 +6,7 @@ import Data.List (intercalate)
 import Control.Monad.State
 import Data.Map (Map, toList, fromList, empty, (!), lookup, insert)
 import ReversibleMap (RMap, rempty, rlookup, rassociate, rinsert, rtoList)
+import Data.Maybe (fromMaybe)
 import Text.Printf
 import Debug.Trace (trace)
 
@@ -38,7 +39,7 @@ cSymbolVar name = do
         put $ state { symbolTypeVars=(insert name newId typeVars) }
         return newId
 
-cUnification :: State CState [(TypeVar, Maybe Type)]
+cUnification :: State CState [(TypeVar, Int, Maybe Type)]
 cUnification = do
   state <- get
   return $ rtoList $ unified state -- toList $ unified state
@@ -58,6 +59,22 @@ cMapsTo i t = do
   state@(CState { unified = m }) <- get
   put $ state { unified = rinsert i t m }
 
+cAddDefaultConstraints :: State CState Constraints
+cAddDefaultConstraints = do
+  dupid <- cSymbolVar "dupint"
+  argtuple <- cNextTypeVar
+  argtuple2 <- cNextTypeVar
+  rettuple <- cNextTypeVar
+  rettuple2 <- cNextTypeVar
+  rettuple3 <- cNextTypeVar
+  inttype <- cNextTypeVar
+  return $ [ C_VarIs dupid $ T_Function argtuple rettuple
+           , C_VarIs inttype T_Int64
+           , C_VarIs argtuple $ T_Tuple inttype argtuple2
+           , C_VarIs rettuple $ T_Tuple inttype rettuple2
+           , C_VarIs rettuple2 $ T_Tuple inttype rettuple3
+           , trace ("SAY" ++ (show rettuple3) ++ "=" ++ (show argtuple2)) $ C_VarEqual rettuple3 argtuple2  ]
+
 exprid = sexprdata
 
 data Type = T_Unit
@@ -72,6 +89,30 @@ tshow :: Type -> String
 tshow (T_Function a r) = "T_Function T" ++ (show a) ++ " T" ++ (show r)
 tshow (T_Tuple a r) = "T_Tuple T" ++ (show a) ++ " T" ++ (show r)
 tshow x = show x
+
+unconstrainedVarString = "_"
+
+pprintType :: Type -> State CState String
+pprintType T_Unit = return "()"
+pprintType T_Float = return "Float"
+pprintType T_Int64 = return "Int64"
+pprintType T_String = return "String"
+pprintType (T_Tuple l r) = do
+  tl <- cUnifiedType l
+  tr <- cUnifiedType r
+  tl' <- pprintTypeMaybe unconstrainedVarString tl
+  tr' <- pprintTypeMaybe unconstrainedVarString tr
+  return $ "(T" ++ (show l) ++ "=" ++ tl' ++ ", T" ++ (show r) ++ "=" ++ tr' ++ ")"
+pprintType (T_Function l r) = do
+  tl <- cUnifiedType l
+  tr <- cUnifiedType r
+  tl' <- pprintTypeMaybe unconstrainedVarString tl
+  tr' <- pprintTypeMaybe unconstrainedVarString tr
+  return $ "(T" ++ (show l) ++ "=" ++ tl' ++ " -> T" ++ (show r) ++ "=" ++ tr' ++ ")"
+
+pprintTypeMaybe :: String -> Maybe Type -> State CState String
+pprintTypeMaybe def Nothing = return def
+pprintTypeMaybe _ (Just t) = pprintType t
 
 data TypeAssertion = C_VarEqual TypeVar TypeVar
                    | C_VarIs TypeVar Type
@@ -98,7 +139,7 @@ constraints (FloatLiteral id _) = literalConstraints id T_Float
 constraints (StringLiteral id _) = literalConstraints id T_String
 constraints (SymbolLiteral id sym) = do
   symVar <- cSymbolVar sym
-  return [C_VarEqual symVar id]
+  return [ C_VarEqual symVar id ]
 constraints (Nil id) = do
   return [ ] -- Nil is unconstrained since it's the "input goes here"
              -- terminal for functions
@@ -106,14 +147,11 @@ constraints (Cons id l r) = do
   lconstraints <- constraints l
   rconstraints <- constraints r
   l_output <- cNextTypeVar
-  l_output_l <- cNextTypeVar
-  l_output_r <- cNextTypeVar
   r_output <- cNextTypeVar
-  return $ [ C_VarIs l_output $ T_Tuple l_output_l l_output_r
-           , C_VarEqual l_output (sexprdata l)
-           , C_VarIs (sexprdata r) $ T_Function l_output r_output
-           , C_VarEqual id r_output
-           ] ++ lconstraints ++ rconstraints
+  return $  lconstraints ++ rconstraints ++
+             [ C_VarEqual l_output (sexprdata l)
+             , C_VarIs (sexprdata r) $ T_Function l_output r_output
+             , C_VarEqual id r_output ]
 
 equalTypes :: Type -> Type -> State CState ()
 equalTypes T_Unit T_Unit = return ()
@@ -135,6 +173,7 @@ applyConstraint (C_VarEqual i j) =
   else do
     t1 <- cUnifiedType i
     t2 <- cUnifiedType j
+    if i == 6 && j == 3 then trace ("BINGO " ++ (show t1) ++ " " ++ (show t2)) (return ()) else return ()
     case (t1, t2) of
       (Nothing, Nothing) ->
           i `cRemapsTo` j
@@ -174,11 +213,17 @@ assignExprId (Cons _ l r) = do
   return $ Cons nid lid rid
 
 genConstraints sexpr = do
+  defconstraints <- cAddDefaultConstraints
   isexpr <- assignExprId sexpr
   consts <- constraints isexpr
-  unify consts
-  assignment <- cUnification
-  return $ (isexpr, consts, assignment)
+  let allconsts = defconstraints ++ consts in do 
+    unify allconsts
+    assignment <- cUnification
+    showassignment <- mapM showpair assignment
+    return $ (isexpr, allconsts, showassignment)
+  where showpair (a, v, b) = do
+                         b' <- pprintTypeMaybe unconstrainedVarString b
+                         return $ "T" ++ (show a) ++ " = V" ++ (show v) ++ ":" ++ b'
 
 walkAst :: (SExpr TypeVar -> IO ()) -> SExpr TypeVar -> IO ()
 walkAst f x@(Cons _ l r) = do
@@ -202,8 +247,8 @@ main = do
   putStrLn "-- Constraints:"
   putStrLn $ intercalate "\n" $ map show constraints
   putStrLn "-- Unification:"
-  putStrLn $ intercalate "\n" $ map show unif
-  where (isexpr, constraints, unif) = case parseToplevel "5 dup" of
+  putStrLn $ intercalate "\n" unif
+  where (isexpr, constraints, unif) = case parseToplevel "5 7 9 dupint" of
                                         Left err -> error $ "No match: " ++ show err
                                         Right val -> evalState (genConstraints val) newstate
 
