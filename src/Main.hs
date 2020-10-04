@@ -59,9 +59,9 @@ cMapsTo i t = do
   state@(CState { unified = m }) <- get
   put $ state { unified = rinsert i t m }
 
-cAddDefaultConstraints :: State CState Constraints
-cAddDefaultConstraints = do
-  dupid <- cSymbolVar "dupint"
+cAddDupintConstraint :: String -> State CState Constraints
+cAddDupintConstraint name = do
+  dupid <- cSymbolVar name
   argtuple <- cNextTypeVar
   argtuple2 <- cNextTypeVar
   rettuple <- cNextTypeVar
@@ -73,7 +73,48 @@ cAddDefaultConstraints = do
            , C_VarIs argtuple $ T_Tuple inttype argtuple2
            , C_VarIs rettuple $ T_Tuple inttype rettuple2
            , C_VarIs rettuple2 $ T_Tuple inttype rettuple3
-           , trace ("SAY" ++ (show rettuple3) ++ "=" ++ (show argtuple2)) $ C_VarEqual rettuple3 argtuple2  ]
+           , C_VarEqual rettuple3 argtuple2 ]
+  
+cAddArithmeticConstraint :: String -> State CState Constraints
+cAddArithmeticConstraint name = do
+  dupid <- cSymbolVar name
+  argtuple <- cNextTypeVar
+  argtuple2 <- cNextTypeVar
+  argtuple3 <- cNextTypeVar
+  rettuple <- cNextTypeVar
+  rettuple2 <- cNextTypeVar
+  inttype <- cNextTypeVar
+  return $ [ C_VarIs dupid $ T_Function argtuple rettuple
+           , C_VarIs inttype T_Int64
+           , C_VarIs argtuple $ T_Tuple inttype argtuple2
+           , C_VarIs argtuple2 $ T_Tuple inttype argtuple3
+           , C_VarIs rettuple $ T_Tuple inttype rettuple2
+           , C_VarEqual argtuple3 rettuple2 ]
+
+cAddLambdaConstraint :: State CState Constraints
+cAddLambdaConstraint = do
+  dupid <- cSymbolVar "λ"
+  argtuple <- cNextTypeVar
+  argtuple2 <- cNextTypeVar
+  argtuple3 <- cNextTypeVar
+  rettuple <- cNextTypeVar
+  rettuple2 <- cNextTypeVar
+  inttype <- cNextTypeVar
+  return $ [ C_VarIs dupid $ T_Function argtuple rettuple
+           , C_VarIs inttype T_Int64
+           , C_VarIs argtuple $ T_Tuple inttype argtuple2
+           , C_VarIs argtuple2 $ T_Tuple inttype argtuple3
+           , C_VarIs rettuple $ T_Tuple inttype rettuple2
+           , C_VarEqual argtuple3 rettuple2 ]
+
+cAddDefaultConstraints :: State CState Constraints
+cAddDefaultConstraints = do
+  c1 <- cAddDupintConstraint "dupint"
+  c2 <- cAddDupintConstraint "dupint2"
+  c3 <- cAddArithmeticConstraint "+"
+  c4 <- cAddArithmeticConstraint "*"
+  c5 <- cAddLambdaConstraint
+  return $ c1 ++ c2 ++ c3 ++ c4
 
 exprid = sexprdata
 
@@ -121,9 +162,9 @@ instance Show TypeAssertion where
     show (C_VarEqual i j) = "T" ++ (show i) ++ " = T" ++ (show j)
     show (C_VarIs i t) = "T" ++ (show i) ++ " = Type(" ++ (tshow t) ++ ")"
 
---type Constraints = Map TypeVar [TypeAssertion]
 type Constraints = [TypeAssertion]
 
+{-
 literalConstraints :: TypeVar -> Type -> State CState Constraints
 literalConstraints id t = do
   argtuple <- cNextTypeVar
@@ -132,6 +173,39 @@ literalConstraints id t = do
   return [ C_VarIs littype t
          , C_VarIs rettuple $ T_Tuple littype argtuple
          , C_VarIs id $ T_Function argtuple rettuple ]
+-}
+
+findNil :: SExpr Int -> SExpr Int
+findNil (Cons _ l _) = findNil l
+findNil n@(Nil _) = n
+findNil _ = error "Cannot find nil in list"
+
+literalConstraints :: TypeVar -> Type -> State CState Constraints
+literalConstraints id t = 
+    return [ C_VarIs id t ]
+
+literalConsConstraints :: SExpr TypeVar -> State CState Constraints
+literalConsConstraints (Cons id l (Cons fid cl cr)) = do
+  clconstraints <- constraints cl
+  crconstraints <- constraints cr
+  lconstraints <- constraints l
+  fnret <- cNextTypeVar
+  return $ (clconstraints
+            ++ crconstraints
+            ++ lconstraints
+            ++ [ C_VarIs id $ T_Tuple fid (sexprdata l)
+               -- cr will return its entire stack, which is
+               -- why we can use its return type as the    
+               -- return type of the lambda
+               , C_VarIs (sexprdata cr) $ T_Function (sexprdata cl) fnret
+               , C_VarIs fid $ T_Function (sexprdata (findNil cl)) (sexprdata cr) ])
+
+literalConsConstraints (Cons id l r) = do
+  lconstraints <- constraints l
+  rconstraints <- constraints r
+  return $ (lconstraints
+            ++ rconstraints
+            ++ [ C_VarIs id $ T_Tuple (sexprdata r) (sexprdata l) ])
 
 constraints :: SExpr TypeVar -> State CState Constraints
 constraints (IntLiteral id _) = literalConstraints id T_Int64
@@ -143,15 +217,13 @@ constraints (SymbolLiteral id sym) = do
 constraints (Nil id) = do
   return [ ] -- Nil is unconstrained since it's the "input goes here"
              -- terminal for functions
-constraints (Cons id l r) = do
+constraints (Cons id l r@(SymbolLiteral _ _)) = do
   lconstraints <- constraints l
   rconstraints <- constraints r
-  l_output <- cNextTypeVar
-  r_output <- cNextTypeVar
-  return $  lconstraints ++ rconstraints ++
-             [ C_VarEqual l_output (sexprdata l)
-             , C_VarIs (sexprdata r) $ T_Function l_output r_output
-             , C_VarEqual id r_output ]
+  return $ (lconstraints
+            ++ rconstraints
+            ++ [ C_VarIs (sexprdata r) $ T_Function (sexprdata l) id ])
+constraints c@(Cons _ _ _) = literalConsConstraints c
 
 equalTypes :: Type -> Type -> State CState ()
 equalTypes T_Unit T_Unit = return ()
@@ -173,7 +245,6 @@ applyConstraint (C_VarEqual i j) =
   else do
     t1 <- cUnifiedType i
     t2 <- cUnifiedType j
-    if i == 6 && j == 3 then trace ("BINGO " ++ (show t1) ++ " " ++ (show t2)) (return ()) else return ()
     case (t1, t2) of
       (Nothing, Nothing) ->
           i `cRemapsTo` j
@@ -248,7 +319,7 @@ main = do
   putStrLn $ intercalate "\n" $ map show constraints
   putStrLn "-- Unification:"
   putStrLn $ intercalate "\n" unif
-  where (isexpr, constraints, unif) = case parseToplevel "5 7 9 dupint" of
+  where (isexpr, constraints, unif) = case parseToplevel "(4)" of
                                         Left err -> error $ "No match: " ++ show err
                                         Right val -> evalState (genConstraints val) newstate
 
